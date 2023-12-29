@@ -1,19 +1,19 @@
 import asyncio
 import socket
+import logging
 from PIL import Image
+
+# Set up basic logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 HOST = '151.217.15.90'  # Replace with the Pixelflut server IP
 PORT = 1337                   # Replace with the Pixelflut server port
-MAX_CONNECTIONS = 100          # Number of connections in the pool
+MAX_CONNECTIONS = 10          # Number of connections in the pool
 IMAGE_PATH = '/home/nils/Bilder/pixel.png'  # Path to the image you want to send
 
 def send_command(sock, command):
     """Send a command to the Pixelflut server."""
     sock.send(f"{command}\n".encode())
-
-def pixel(sock, x, y, color):
-    """Send a pixel command to the Pixelflut server."""
-    send_command(sock, f"PX {x} {y} {color}")
 
 async def get_canvas_size(sock):
     """Retrieve the canvas size from the Pixelflut server."""
@@ -35,30 +35,44 @@ async def send_image_section(sock, image, start_row, end_row):
     for y in range(start_row, end_row):
         for x in range(width):
             r, g, b = image.getpixel((x, y))
-            pixel(sock, x, y, f'{r:02x}{g:02x}{b:02x}')
+            send_command(sock, f'PX {x} {y} {r:02x}{g:02x}{b:02x}')
         await asyncio.sleep(0.01)  # Prevent overwhelming the server
 
-async def create_connection():
-    """Create a new connection to the server."""
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    await asyncio.to_thread(sock.connect, (HOST, PORT))
-    return sock
+async def create_connection(attempts=5):
+    """Create a new connection to the server with retries."""
+    for attempt in range(attempts):
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            await asyncio.to_thread(sock.connect, (HOST, PORT))
+            return sock
+        except Exception as e:
+            logging.error(f"Connection attempt {attempt + 1} failed: {e}")
+            if attempt < attempts - 1:
+                await asyncio.sleep(5)
 
 async def main():
-    connections = [await create_connection() for _ in range(MAX_CONNECTIONS)]
+    # Establish the first connection to get canvas size
+    primary_sock = await create_connection()
+    if not primary_sock:
+        logging.error("Failed to connect to the server.")
+        return
 
-    # Use the first connection to get the canvas size
-    canvas_width, canvas_height = await get_canvas_size(connections[0])
+    canvas_width, canvas_height = await get_canvas_size(primary_sock)
+    primary_sock.close()
 
     # Prepare the image
     image = prepare_image(IMAGE_PATH, canvas_width, canvas_height)
 
-    # Divide the image and send in parallel
-    height_per_connection = image.height // MAX_CONNECTIONS
+    # Establish connections and send image in parallel
+    connections = await asyncio.gather(*(create_connection() for _ in range(MAX_CONNECTIONS)))
+    height_per_connection = canvas_height // MAX_CONNECTIONS
+
     tasks = []
     for i, sock in enumerate(connections):
+        if not sock:
+            continue
         start_row = i * height_per_connection
-        end_row = (i + 1) * height_per_connection if i < MAX_CONNECTIONS - 1 else image.height
+        end_row = (i + 1) * height_per_connection if i < MAX_CONNECTIONS - 1 else canvas_height
         task = asyncio.create_task(send_image_section(sock, image, start_row, end_row))
         tasks.append(task)
 
@@ -66,8 +80,8 @@ async def main():
 
     # Close all connections
     for sock in connections:
-        sock.close()
+        if sock:
+            sock.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
-
